@@ -1,0 +1,430 @@
+---
+title: "Differential Expression on survival"
+output: html_notebook
+---
+
+2) запускаешь дифэкспрессию между хорошей и плохой выживаемостью,
+делаешь fgsea для статистики диф экспрессии для всех 10К генов
+
+
+то есть
+1 - 10к генов
+2 - делим по выживаемости (times=2500)
+3 - диффэкспрессия
+4 - fgsea для статистики дифф экспрессии
+
+```{r warning=FALSE, message=FALSE}
+library(dplyr) # loads dplyr
+library(survival) # core survival analysis functions
+library(survminer) # recommended for visualizing survival curves
+# Bioconductor packages
+library(RTCGA)
+library(RTCGA.clinical)
+library(RTCGA.mRNA)
+```
+
+```{r warning=FALSE, message=FALSE}
+library(DESeq2)
+library(ggplot2)
+library(vsn)
+library(pheatmap)
+library(ggrepel)
+set.seed(1)
+```
+
+# Собираем данные
+
+clinical data
+
+```{r}
+clinkLung <- survivalTCGA(LUSC.clinical,
+                          extract.cols=c("admin.disease_code",
+                                         "patient.gender",
+                                         "patient.days_to_death",
+                                         "patient.days_to_last_followup"))
+dim(clinkLung)
+head(clinkLung)
+
+hist(clinkLung$times)
+```
+
+RNA
+
+```{r}
+raw.counts <- readRDS("LUSC_counts.rds")
+
+dim(raw.counts)
+as.data.frame(raw.counts[1:5, 1:5])
+```
+
+```{r}
+dim(raw.counts)
+counts.rna <- raw.counts[,!duplicated(substr(colnames(raw.counts), 1, 12))]
+dim(counts.rna)
+colnames(counts.rna) <- substr(colnames(counts.rna), 1, 12)
+patients.rows <- Reduce(intersect,list(clinkLung$bcr_patient_barcode,colnames(counts.rna)))
+counts.rna <- counts.rna %>% 
+  as.data.frame() %>%
+  dplyr::select(order(colnames(counts.rna))) %>%
+  dplyr::select(patients.rows) %>%
+  dplyr::slice_max(rowSums(.), n = 10000)
+dim(counts.rna)
+counts.rna[1:5, 1:5]
+```
+
+concatenate rna + clinical data
+
+good/bad survival using times
+
+1 - dead (event), 0 - alive/censored
+1 - bad survival, 0 - good
+
+только для диффэкспрессии
+
+```{r}
+head(clinkLung)
+
+clinkLung_withSurvival <- clinkLung %>%
+  mutate_at(c('patient.days_to_death', 'patient.days_to_last_followup'), as.numeric) %>%
+  filter((patient.vital_status == 1 | patient.days_to_last_followup >= 2500)) %>%
+  mutate(survival = ifelse((patient.vital_status == 1 & patient.days_to_death < 2500),"bad","good"))
+
+rownames(clinkLung_withSurvival) <- clinkLung_withSurvival$bcr_patient_barcode
+
+head(clinkLung_withSurvival)
+dim(clinkLung_withSurvival)
+
+clinik.and.rna <- as.data.frame(t(counts.rna))
+clinik.and.rna$bcr_patient_barcode <- substr(rownames(clinik.and.rna), 1, 12)
+clinik.and.rna <- clinik.and.rna %>%
+  inner_join(clinkLung_withSurvival, by="bcr_patient_barcode")
+clinik.and.rna[1:5, 1:5]
+```
+
+```{r}
+counts.rna.surv <- as.data.frame(counts.rna)
+colnames(counts.rna.surv) <- substr(colnames(counts.rna.surv), 1, 12)
+counts.rna.surv <- counts.rna.surv[, colnames(counts.rna.surv) %in% clinkLung_withSurvival$bcr_patient_barcode]
+counts.rna.surv[1:5,1:5]
+```
+
+```{r}
+pdata <- clinik.and.rna %>%
+  arrange(bcr_patient_barcode) %>%
+  dplyr::select(c("survival", "admin.disease_code", "patient.gender"))
+
+pdata <- pdata[ order(row.names(pdata)), ]
+
+head(pdata)
+```
+
+make sure there are no outliers
+
+```{r}
+ddsSimple <- DESeqDataSetFromMatrix(counts.rna.surv,
+                              data.frame(strain=pdata$survival,
+                                         libsize=colSums(counts.rna.surv),
+                                         sampleName=colnames(counts.rna.surv),
+                                         row.names=colnames(counts.rna.surv)), design=~1)
+ddsSimple <- DESeq(ddsSimple)
+
+vsdSimple <- varianceStabilizingTransformation(ddsSimple)
+plotPCA(vsdSimple, "libsize") + geom_text_repel(aes(label=name), size=2) + theme_bw()
+```
+
+# Differencial expression
+
+```{r warning=FALSE, message=FALSE}
+dds <- DESeqDataSetFromMatrix(countData = counts.rna.surv,
+                              colData = pdata,
+                              design= ~ survival + patient.gender)
+dds <- DESeq(dds)
+resultsNames(dds)
+```
+
+```{r}
+vsd <- varianceStabilizingTransformation(dds)
+plotPCA(vsd, "sizeFactor") + aes(color=dds$patient.gender, shape=dds$survival) + theme_bw()
+plotPCA(vsd, "sizeFactor") + aes(color=dds$survival, shape=dds$patient.gender) + theme_bw()
+```
+
+## Volcano plot
+
+```{r warning=FALSE, message=FALSE}
+resultsNames(dds)
+resShrinked <- lfcShrink(dds, coef="survival_good_vs_bad", type="apeglm")
+resShrinked$Gene.symbol <- rownames(resShrinked)
+
+head(resShrinked)
+
+resDF <- as.data.frame(resShrinked)
+ggplot(resDF, aes(x=log2FoldChange, y=-log10(padj), color=padj < 0.05)) +
+  geom_point() + theme_bw() + scale_color_manual(values=c("black", "red")) +
+  geom_text_repel(data=resDF %>% dplyr::filter(padj < 0.05), aes(label=Gene.symbol), color="black") +
+  xlim(c(-6, 6)) + xlab("good     Log2FC    bad") + geom_vline(xintercept = 0, lty=2) +
+  theme(aspect.ratio = 1)
+```
+
+```{r}
+counts.rna.amounts <- as.data.frame(t(counts.rna))
+counts.rna.amounts$bcr_patient_barcode <- substr(rownames(counts.rna.amounts), 1, 12)
+counts.rna.amounts <- counts.rna.amounts %>%
+  inner_join(clinkLung, by="bcr_patient_barcode")
+counts.rna.amounts[1:5, 1:5]
+```
+
+```{r}
+resDF %>% filter(padj < 0.05) %>% arrange(padj)
+```
+
+```{r}
+mean(counts.rna.amounts$FABP4)
+ggplot(counts.rna.amounts, aes(FABP4)) + geom_histogram(bins=20)
+```
+
+
+```{r}
+counts.rna.amounts$FABP4_amount <- cut(counts.rna.amounts$FABP4,
+                                           breaks=c(-Inf, 180, Inf),
+                                           labels=c("low", "high"))
+
+ggsurvplot(survfit(Surv(times, patient.vital_status)~FABP4_amount, data=counts.rna.amounts), pval=TRUE, conf.int=TRUE)
+```
+
+```{r}
+mean(counts.rna.amounts$SFTPA1)
+hist(counts.rna.amounts$SFTPA1)
+ggplot(counts.rna.amounts, aes(SFTPA1)) + geom_histogram(bins=20)
+```
+
+```{r}
+counts.rna.amounts$SFTPA1_amount <- cut(counts.rna.amounts$SFTPA1,
+                                           breaks=c(-Inf, 1500, Inf),
+                                           labels=c("low", "high"))
+
+ggsurvplot(survfit(Surv(times, patient.vital_status)~SFTPA1_amount, data=counts.rna.amounts), pval=TRUE, conf.int=TRUE)
+```
+
+```{r}
+mean(counts.rna.amounts$CLDN18)
+hist(counts.rna.amounts$CLDN18)
+ggplot(counts.rna.amounts, aes(CLDN18)) + geom_histogram(bins=20)
+```
+
+```{r}
+counts.rna.amounts$CLDN18_amount <- cut(counts.rna.amounts$CLDN18,
+                                           breaks=c(-Inf, 1100, Inf),
+                                           labels=c("low", "high"))
+
+ggsurvplot(survfit(Surv(times, patient.vital_status)~CLDN18_amount, data=counts.rna.amounts), pval=TRUE, conf.int=TRUE)
+```
+
+```{r}
+mean(counts.rna.amounts$PSCA)
+hist(counts.rna.amounts$PSCA)
+ggplot(counts.rna.amounts, aes(PSCA)) + geom_histogram(bins=20)
+```
+
+```{r}
+counts.rna.amounts$PSCA_amount <- cut(counts.rna.amounts$PSCA,
+                                           breaks=c(-Inf, 3000, Inf),
+                                           labels=c("low", "high"))
+
+ggsurvplot(survfit(Surv(times, patient.vital_status)~PSCA_amount, data=counts.rna.amounts), pval=TRUE, conf.int=TRUE)
+```
+
+check for just in case that we had both conditions
+
+```{r warning=FALSE, message=FALSE}
+resultsNames(dds)
+resShrinked_lusc <- lfcShrink(dds, coef="patient.gender_male_vs_female", type="apeglm")
+resShrinked_lusc$Gene.symbol <- rownames(resShrinked_lusc)
+
+head(resShrinked_lusc)
+
+resDF_lusc <- as.data.frame(resShrinked_lusc)
+ggplot(resDF_lusc, aes(x=log2FoldChange, y=-log10(padj), color=padj < 0.05)) +
+  geom_point() + theme_bw() + scale_color_manual(values=c("black", "red")) +
+  geom_text_repel(data=resDF_lusc %>% dplyr::filter(padj < 1e-2), aes(label=Gene.symbol), color="black") +
+  xlim(c(-6, 6)) + xlab("male     Log2FC    female") + geom_vline(xintercept = 0, lty=2) +
+  theme(aspect.ratio = 1)
+```
+
+```{r}
+upregulated <- resDF %>%
+  filter(log2FoldChange > 0 & padj < 0.05) %>%
+  arrange(desc(log2FoldChange))
+writeLines(rownames(upregulated), "surv_upregulated.txt")
+dim(upregulated)
+
+downregulated <- resDF %>%
+  filter(log2FoldChange < 0 & padj < 0.05) %>%
+  arrange(log2FoldChange)
+writeLines(rownames(downregulated), "surv_downregulated.txt")
+dim(downregulated)
+```
+## Pathway analysis
+
+```{r}
+library(fgsea)
+load("keggSymbolHuman.rdata")
+```
+
+FGSEA
+
+```{r}
+#log2FoldChange < 0 = upregulated
+stats <- resDF$log2FoldChange
+names(stats) <- rownames(resDF)
+
+fgseaResults.kegg <- fgseaMultilevel(keggSymbolHuman, stats, minSize = 15, maxSize = 500)
+head(fgseaResults.kegg %>% arrange(padj))
+```
+
+KEGG - not cool results, nothing statistically significant
+
+msigdb hallmarks pathways enrichment
+
+```{r}
+library(msigdb)
+```
+
+```{r}
+msigdb.hs = getMsigdb(org = 'hs',id = c("SYM", "EZID"))
+# Downloading and integrating KEGG gene sets
+msigdb.hs = appendKEGG(msigdb.hs)
+length(msigdb.hs)
+```
+
+Immune, oncogeic and hallmark sublists
+
+Alexey suggested that I should use more human readable subsets
+like c2, c5 and h
+
+```{r}
+# You can select a child gene set according to the requirements
+listCollections(msigdb.hs)
+subset_msigdb = subsetCollection(msigdb.hs, c('h', 'c2', 'c5'))
+
+#msigdb_ids <- geneIds(msigdb.hs)
+msigdb_ids <- geneIds(subset_msigdb)
+```
+
+results here differs from those on
+https://www.gsea-msigdb.org/gsea/msigdb/human/compute_overlaps.jsp
+
+```{r}
+fgseaResults_msigdb <- fgseaMultilevel(msigdb_ids, stats, minSize = 15, maxSize = 500)
+dim(fgseaResults_msigdb)
+dim(fgseaResults_msigdb %>% filter(padj < 0.05))
+head(fgseaResults_msigdb %>% arrange(padj))
+```
+
+MODULE_55 is Genes in the cancer module 55.
+
+```{r}
+topPathwaysUp <- fgseaResults_msigdb[ES > 0, ][head(order(padj), n=5), pathway]
+topPathwaysDown <- fgseaResults_msigdb[ES < 0, ][head(order(padj), n=5), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+plotGseaTable(msigdb_ids[topPathways], stats, fgseaResults_msigdb, gseaParam = 0.5,
+              pathwayLabelStyle=list(size=5))
+```
+
+3) Для какого-то датасета разделить образцы с хорошей и плохой выживаемостью, сделать дифэкспрессию, и анализ пасвэев (msigdb hallmarks или gene ontology biological processes)
+* После взять значимый, усреднить экспрессию его генов для каждого пациента, и сделать cox regression
+* Сгенерировать 1000 случайных наборов генов такого же размера и проверить, что у них cox regression likelihood будет хуже чем у исходного пасвэя
+* Аналогично сделать для какого-то левого пасвэя, у которого не было значимости
+
+3) есть пасвэи, для каждого пасвэя усреднить экспрессиию и сделать cox regression на получившихся "профилях" для пасвэев
+
+```{r}
+counts.rna.voom <- limma::voom(counts.rna, plot = T)
+
+head(as.data.frame(counts.rna.voom$targets))
+head(as.data.frame(counts.rna.voom$weights))
+head(as.data.frame(counts.rna.voom$design))
+head(as.data.frame(counts.rna.voom$E))
+boxplot(as.data.frame(counts.rna.voom[, 1:10]$E))
+```
+
+
+```{r}
+clinik.and.rna.pathways <- as.data.frame(t(counts.rna.voom$E))
+clinik.and.rna.pathways$bcr_patient_barcode <- substr(rownames(clinik.and.rna.pathways), 1, 12)
+clinik.and.rna.pathways <- clinik.and.rna.pathways %>%
+  inner_join(clinkLung, by="bcr_patient_barcode")
+dim(clinik.and.rna.pathways)
+head(clinik.and.rna.pathways)
+```
+
+
+```{r}
+for(pathway in topPathways) {
+  genes <- intersect(unique(unlist(msigdb_ids[pathway])), colnames(clinik.and.rna.pathways))
+
+  clinik.and.rna.pathways[pathway] <- rowMeans(clinik.and.rna.pathways[, genes])
+}
+
+pathways_to_test <- topPathways
+
+head(clinik.and.rna.pathways[pathways_to_test])
+#clinik.and.rna[, test_pathway[, 1][test_pathway[, 1] %in% colnames(clinik.and.rna)]]
+#rowMeans(clinik.and.rna[, test_pathway[, 1][test_pathway[, 1] %in% colnames(clinik.and.rna)]])
+```
+
+```{r}
+Survfun <- function(gene) as.formula(paste("Surv(times,patient.vital_status)",gene,sep="~"))
+
+survival.coxph.pathways <- 
+  sapply(pathways_to_test, function(gene) summary(coxph(Survfun(gene), data=clinik.and.rna.pathways)))
+```
+
+```{r}
+survival.coxph.pathways <- survival.coxph.pathways %>% t() %>% as.data.frame() %>% dplyr::select(coefficients)
+survival.coxph.pathways[1,]
+coxph(Surv(times,patient.vital_status)~SABATES_COLORECTAL_ADENOMA_UP, data=clinik.and.rna.pathways)
+```
+
+```{r}
+survival.coxph.pathways.rownames <- rownames(survival.coxph.pathways)
+
+survival.coxph.pathways <- as.data.frame(matrix(unlist(survival.coxph.pathways),ncol=5,byrow=TRUE))
+rownames(survival.coxph.pathways) <- survival.coxph.pathways.rownames
+colnames(survival.coxph.pathways) <- c("coef", "HR", "se", "z", "Pval")
+
+survival.coxph.pathways %>% arrange(Pval)
+```
+
+```{r}
+mean(clinik.and.rna.pathways$GOBP_TUMOR_NECROSIS_FACTOR_SUPERFAMILY_CYTOKINE_PRODUCTION)
+hist(clinik.and.rna.pathways$GOBP_TUMOR_NECROSIS_FACTOR_SUPERFAMILY_CYTOKINE_PRODUCTION)
+ggplot(clinik.and.rna.pathways, aes(GOBP_TUMOR_NECROSIS_FACTOR_SUPERFAMILY_CYTOKINE_PRODUCTION)) + geom_histogram(bins=20)
+```
+
+```{r}
+clinik.and.rna.pathways$GOBP_TUMOR_NECROSIS_FACTOR_SUPERFAMILY_CYTOKINE_PRODUCTION_amount <-
+  cut(clinik.and.rna.pathways$GOBP_TUMOR_NECROSIS_FACTOR_SUPERFAMILY_CYTOKINE_PRODUCTION,
+      breaks=c(-Inf, 5.3, Inf),
+      labels=c("low", "high"))
+
+ggsurvplot(survfit(Surv(times, patient.vital_status)~GOBP_TUMOR_NECROSIS_FACTOR_SUPERFAMILY_CYTOKINE_PRODUCTION_amount,
+                   data=clinik.and.rna.pathways), pval=TRUE, conf.int=TRUE)
+```
+
+
+
+```{r}
+mean(clinik.and.rna.pathways$GOBP_REGULATION_OF_TUMOR_NECROSIS_FACTOR_SUPERFAMILY_CYTOKINE_PRODUCTION)
+hist(clinik.and.rna.pathways$GOBP_REGULATION_OF_TUMOR_NECROSIS_FACTOR_SUPERFAMILY_CYTOKINE_PRODUCTION)
+ggplot(clinik.and.rna.pathways, aes(GOBP_REGULATION_OF_TUMOR_NECROSIS_FACTOR_SUPERFAMILY_CYTOKINE_PRODUCTION)) + geom_histogram(bins=20)
+```
+
+```{r}
+clinik.and.rna.pathways$GOBP_REGULATION_OF_TUMOR_NECROSIS_FACTOR_SUPERFAMILY_CYTOKINE_PRODUCTION_amount <-
+  cut(clinik.and.rna.pathways$GOBP_REGULATION_OF_TUMOR_NECROSIS_FACTOR_SUPERFAMILY_CYTOKINE_PRODUCTION,
+      breaks=c(-Inf, 5.3, Inf),
+      labels=c("low", "high"))
+
+ggsurvplot(survfit(Surv(times, patient.vital_status)~GOBP_REGULATION_OF_TUMOR_NECROSIS_FACTOR_SUPERFAMILY_CYTOKINE_PRODUCTION_amount,
+                   data=clinik.and.rna.pathways), pval=TRUE, conf.int=TRUE)
+```

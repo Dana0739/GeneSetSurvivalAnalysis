@@ -1,0 +1,163 @@
+---
+title: "Pathways from msigdb to Coxp"
+output: html_notebook
+---
+
+```{r warning=FALSE, message=FALSE}
+library(dplyr) # loads dplyr
+library(survival) # core survival analysis functions
+library(survminer) # recommended for visualizing survival curves
+# Bioconductor packages
+library(RTCGA)
+library(RTCGA.clinical)
+library(RTCGA.mRNA)
+set.seed(1)
+```
+
+# Собираем данные
+
+clinical data
+
+```{r}
+clinkLung <- survivalTCGA(LUSC.clinical,
+                          extract.cols=c("admin.disease_code",
+                                         "patient.gender",
+                                         "patient.days_to_death",
+                                         "patient.days_to_last_followup"))
+
+head(clinkLung)
+
+hist(clinkLung$times)
+```
+
+RNA
+
+```{r}
+raw.counts <- readRDS("LUSC_counts.rds")
+dim(raw.counts)
+as.data.frame(raw.counts[1:5, 1:5])
+```
+
+```{r}
+dim(raw.counts)
+counts.rna <- raw.counts[,!duplicated(substr(colnames(raw.counts), 1, 12))]
+dim(counts.rna)
+colnames(counts.rna) <- substr(colnames(counts.rna), 1, 12)
+patients.rows <- Reduce(intersect,list(clinkLung$bcr_patient_barcode,colnames(counts.rna)))
+counts.rna <- counts.rna %>% 
+  as.data.frame() %>%
+  dplyr::select(order(colnames(counts.rna))) %>%
+  dplyr::select(patients.rows) %>%
+  dplyr::slice_max(rowSums(.), n = 10000)
+dim(counts.rna)
+counts.rna[1:5, 1:5]
+```
+
+для cox regression надо, чтобы данные были в лог-шкале и нормализованные между образцами
+нормализацию можно через limma::voom, можно через rlog (но это вероятно будет долго), можно edgeR TMM и log после этого
+
+```{r}
+counts.rna.voom <- limma::voom(counts.rna, plot = T)
+
+#head(as.data.frame(counts.rna.voom$targets))
+#head(as.data.frame(counts.rna.voom$weights))
+#head(as.data.frame(counts.rna.voom$design))
+#head(as.data.frame(counts.rna.voom$E))
+boxplot(as.data.frame(counts.rna.voom[, 1:10]$E))
+
+#counts.rna.log.norm <- limma::normalizeBetweenArrays(log2(counts.rna + 1))
+#boxplot(counts.rna.log.norm[, 1:10])
+```
+
+concatenate rna + clinical data
+
+```{r}
+clink.and.rna <- as.data.frame(t(counts.rna.voom$E))
+clink.and.rna$bcr_patient_barcode <- substr(rownames(clink.and.rna), 1, 12)
+clink.and.rna <- clink.and.rna %>%
+  inner_join(clinkLung, by="bcr_patient_barcode")
+dim(clink.and.rna)
+head(clink.and.rna)
+```
+
+msigdb hallmarks pathways enrichment
+
+```{r}
+library(msigdb)
+```
+
+```{r}
+msigdb.hs = getMsigdb(org = 'hs',id = c("SYM", "EZID"))
+# Downloading and integrating KEGG gene sets
+msigdb.hs = appendKEGG(msigdb.hs)
+length(msigdb.hs)
+```
+
+```{r}
+# You can select a child gene set according to the requirements
+listCollections(msigdb.hs)
+subset_msigdb = subsetCollection(msigdb.hs, c('h', 'c2', 'c5'))
+
+#msigdb_ids <- geneIds(msigdb.hs)
+msigdb_ids <- geneIds(subset_msigdb)
+```
+
+```{r}
+library(stringr)
+```
+
+```{r}
+clinik.and.rna.pathways <- clink.and.rna
+
+pathways_to_test <-
+  unlist(lapply(names(msigdb_ids),
+                function(pathway) str_replace_all(pathway, "[^[[:alnum:]|_]]", "")))
+# writeLines(pathways_to_test, "pathways.txt")
+```
+
+started at:
+"2023-06-22 08:51:57 MSK"
+finished at:
+"2023-06-22 09:16:41 MSK"
+
+code below works about 30 minutes)
+
+```{r}
+Sys.time()
+
+Survfun <- function(gene) as.formula(paste("Surv(times,patient.vital_status)",gene,sep="~"))
+
+survival.coxph.pathways <- data.frame(
+  coef=double(),
+  HR=double(),
+  se=double(),
+  z=double(),
+  Pval=double(), #"Pr(>|z|)"
+  stringsAsFactors=F)
+
+for(i in c(1:length(pathways_to_test))) {
+  pathway <- pathways_to_test[i]
+  print(i)
+  genes <- intersect(unique(unlist(msigdb_ids[i])), colnames(clinik.and.rna.pathways))
+  clinik.and.rna.pathways.tmp <- clink.and.rna
+  
+  if (length(genes) > 0) {
+    if (length(genes) == 1) {
+      clinik.and.rna.pathways.tmp[pathway] <- clinik.and.rna.pathways[, genes]
+    } else {
+     clinik.and.rna.pathways.tmp[pathway] <- rowMeans(clinik.and.rna.pathways[, genes])
+    }
+  
+    survival.coxph.pathway <-
+      as.data.frame(summary(coxph(Survfun(pathway), data=clinik.and.rna.pathways.tmp))$coefficients)
+    colnames(survival.coxph.pathway) <- c("coef", "HR", "se", "z", "Pval")
+  
+    survival.coxph.pathways <- rbind(survival.coxph.pathways, survival.coxph.pathway)
+  }
+}
+
+dim(survival.coxph.pathways)
+head(survival.coxph.pathways %>% arrange(Pval), 10)
+
+Sys.time()
+```

@@ -1,0 +1,380 @@
+---
+title: "Survival pathways"
+output: html_notebook
+---
+
+```{r warning=FALSE, message=FALSE}
+library(dplyr) # loads dplyr
+library(survival) # core survival analysis functions
+library(survminer) # recommended for visualizing survival curves
+# Bioconductor packages
+library(RTCGA)
+library(RTCGA.clinical)
+library(RTCGA.mRNA)
+```
+
+
+```{r warning=FALSE, message=FALSE}
+#library(DESeq2)
+#library(ggplot2)
+#library(vsn)
+#library(pheatmap)
+#library(ggrepel)
+set.seed(1)
+```
+
+# Собираем данные
+
+clinical data
+
+```{r}
+clinkLung <- survivalTCGA(LUSC.clinical,
+                          extract.cols=c("admin.disease_code",
+                                         "patient.gender",
+                                         "patient.days_to_death",
+                                         "patient.days_to_last_followup"))
+
+head(clinkLung)
+
+hist(clinkLung$times)
+```
+
+RNA
+
+```{r}
+raw.counts <- readRDS("LUSC_counts.rds")
+dim(raw.counts)
+as.data.frame(raw.counts[1:5, 1:5])
+```
+```{r}
+dim(raw.counts)
+counts.rna <- raw.counts[,!duplicated(substr(colnames(raw.counts), 1, 12))]
+dim(counts.rna)
+colnames(counts.rna) <- substr(colnames(counts.rna), 1, 12)
+patients.rows <- Reduce(intersect,list(clinkLung$bcr_patient_barcode,colnames(counts.rna)))
+counts.rna <- counts.rna %>% 
+  as.data.frame() %>%
+  dplyr::select(order(colnames(counts.rna))) %>%
+  dplyr::select(patients.rows) %>%
+  dplyr::slice_max(rowSums(.), n = 10000)
+dim(counts.rna)
+counts.rna[1:5, 1:5]
+```
+
+для cox regression надо, чтобы данные были в лог-шкале и нормализованные между образцами
+нормализацию можно через limma::voom, можно через rlog (но это вероятно будет долго), можно edgeR TMM и log после этого
+
+```{r}
+counts.rna.voom <- limma::voom(counts.rna, plot = T)
+
+head(as.data.frame(counts.rna.voom$targets))
+head(as.data.frame(counts.rna.voom$weights))
+head(as.data.frame(counts.rna.voom$design))
+#head(as.data.frame(counts.rna.voom$E))
+boxplot(as.data.frame(counts.rna.voom[, 1:10]$E))
+
+#counts.rna.log.norm <- limma::normalizeBetweenArrays(log2(counts.rna + 1))
+#boxplot(counts.rna.log.norm[, 1:10])
+```
+
+concatenate rna + clinical data
+
+```{r}
+clink.and.rna <- as.data.frame(t(counts.rna.voom$E))
+clink.and.rna$bcr_patient_barcode <- substr(rownames(clink.and.rna), 1, 12)
+clink.and.rna <- clink.and.rna %>%
+  inner_join(clinkLung, by="bcr_patient_barcode")
+dim(clink.and.rna)
+head(clink.and.rna)
+```
+
+cox regression для каждого гена
+
+```{r}
+Survfun <- function(gene) as.formula(paste("Surv(times,patient.vital_status)",gene,sep="~"))
+
+survival.coxph <- sapply(setdiff(colnames(clink.and.rna),colnames(clinkLung)),
+                         function(gene) summary(coxph(Survfun(gene), data=clink.and.rna)))
+```
+
+```{r}
+survival.coxph <- survival.coxph %>% t() %>% as.data.frame() %>% select(coefficients)
+survival.coxph[1,]
+coxph(Surv(times,patient.vital_status)~MT.CO1, data=clink.and.rna)
+```
+
+The exp(coef) column contains eβ1
+ (see background section above for more info). This is the hazard ratio – the multiplicative effect of that variable on the hazard rate (for each unit increase in that variable).
+
+HR=1: No effect
+HR>1: Increase in hazard
+HR<1: Reduction in hazard (protective)
+
+The p-value comes from testing the null hypothesis that this hazard ratio is 1, or that there is no difference in the relative risk of the event comparing individuals with varying levels of LVEF. When you control for multiple covariates at the same time, the interpretation of the hazard ratio changes somewhat.
+
+задача - отранжировать все экспрессируемые гены по их влиянию на выживаемость
+
+```{r}
+survival.coxph.rownames <- rownames(survival.coxph)
+
+survival.coxph <- as.data.frame(matrix(unlist(survival.coxph),ncol=5,byrow=TRUE))
+rownames(survival.coxph) <- survival.coxph.rownames
+colnames(survival.coxph) <- c("coef", "HR", "se", "z", "Pval")
+
+head(survival.coxph %>% arrange(Pval))
+```
+
+```{r}
+clink.and.rna.amounts <- clink.and.rna
+```
+
+```{r}
+mean(clink.and.rna$FGA)
+hist(clink.and.rna$FGA)
+ggplot(clink.and.rna, aes(FGA)) + geom_histogram(bins=20)
+```
+
+```{r}
+clink.and.rna.amounts$FGA_amount <-
+  cut(clink.and.rna.amounts$FGA,
+      breaks=c(-Inf, -0.225, Inf),
+      labels=c("low", "high"))
+
+ggsurvplot(survfit(Surv(times, patient.vital_status)~FGA_amount,
+                   data=clink.and.rna.amounts), pval=TRUE, conf.int=TRUE)
+```
+
+```{r}
+mean(clink.and.rna$MRPS21)
+hist(clink.and.rna$MRPS21)
+ggplot(clink.and.rna, aes(MRPS21)) + geom_histogram(bins=20)
+```
+
+```{r}
+clink.and.rna.amounts$MRPS21_amount <-
+  cut(clink.and.rna.amounts$MRPS21,
+      breaks=c(-Inf, 5.8, Inf),
+      labels=c("low", "high"))
+
+ggsurvplot(survfit(Surv(times, patient.vital_status)~MRPS21_amount,
+                   data=clink.and.rna.amounts), pval=TRUE, conf.int=TRUE)
+```
+
+```{r}
+mean(clink.and.rna$SLFN13)
+hist(clink.and.rna$SLFN13)
+ggplot(clink.and.rna, aes(SLFN13)) + geom_histogram(bins=20)
+```
+
+```{r}
+clink.and.rna.amounts$SLFN13_amount <-
+  cut(clink.and.rna.amounts$SLFN13,
+      breaks=c(-Inf, 3.8, Inf),
+      labels=c("low", "high"))
+
+ggsurvplot(survfit(Surv(times, patient.vital_status)~SLFN13_amount,
+                   data=clink.and.rna.amounts), pval=TRUE, conf.int=TRUE)
+```
+
+```{r}
+mean(clink.and.rna$FGG)
+hist(clink.and.rna$FGG)
+ggplot(clink.and.rna, aes(FGG)) + geom_histogram(bins=20)
+```
+
+```{r}
+clink.and.rna.amounts$FGG_amount <-
+  cut(clink.and.rna.amounts$FGG,
+      breaks=c(-Inf, 1.7, Inf),
+      labels=c("low", "high"))
+
+ggsurvplot(survfit(Surv(times, patient.vital_status)~FGG_amount,
+                   data=clink.and.rna.amounts), pval=TRUE, conf.int=TRUE)
+```
+
+```{r}
+hazards <- survival.coxph %>%
+  filter(HR > 1 & Pval < 0.05) %>%
+  arrange(desc(HR))
+writeLines(rownames(hazards), "surv_hazards.txt")
+dim(hazards)
+
+protectors <- survival.coxph %>%
+  filter(HR < 1 & Pval < 0.05) %>%
+  arrange(HR)
+writeLines(rownames(protectors), "surv_protectors.txt")
+dim(protectors)
+```
+
+если будет ранжирование, то можно будет делать пасвэй анализ
+
+```{r}
+library(fgsea)
+load("keggSymbolHuman.rdata")
+```
+
+FGSEA
+
+```{r}
+stats <- survival.coxph$HR
+names(stats) <- rownames(survival.coxph)
+
+fgseaResults_kegg <- fgseaMultilevel(keggSymbolHuman, stats, minSize = 15, maxSize = 500)
+head(fgseaResults_kegg %>% arrange(padj))
+```
+
+```{r}
+topPathwaysUp <- fgseaResults_kegg[ES > 0, ][head(order(padj), n=5), pathway]
+topPathwaysDown <- fgseaResults_kegg[ES < 0, ][head(order(padj), n=5), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+plotGseaTable(keggSymbolHuman[topPathways], stats, fgseaResults_kegg, gseaParam = 0.5,
+              pathwayLabelStyle=list(size=8))
+```
+
+msigdb hallmarks pathways enrichment
+
+```{r}
+library(msigdb)
+```
+
+```{r}
+msigdb.hs = getMsigdb(org = 'hs',id = c("SYM", "EZID"))
+# Downloading and integrating KEGG gene sets
+msigdb.hs = appendKEGG(msigdb.hs)
+length(msigdb.hs)
+```
+
+```{r}
+# You can select a child gene set according to the requirements
+listCollections(msigdb.hs)
+subset_msigdb = subsetCollection(msigdb.hs, c('h', 'c2', 'c5'))
+
+#msigdb_ids <- geneIds(msigdb.hs)
+msigdb_ids <- geneIds(subset_msigdb)
+```
+
+```{r}
+fgseaResults_msigdb <- fgseaMultilevel(msigdb_ids, stats, minSize = 15, maxSize = 500)
+head(fgseaResults_msigdb %>% arrange(padj))
+```
+
+I guess I have found good results
+
+```{r}
+topPathwaysUp <- fgseaResults_msigdb[ES > 0, ][head(order(padj), n=5), pathway]
+topPathwaysDown <- fgseaResults_msigdb[ES < 0, ][head(order(padj), n=5), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+plotGseaTable(msigdb_ids[topPathways], stats, fgseaResults_msigdb, gseaParam = 0.5,
+              pathwayLabelStyle=list(size=5))
+```
+
+```{r}
+clinik.and.rna.pathways <- clink.and.rna
+```
+
+```{r}
+for(pathway in topPathways) {
+  genes <- intersect(unique(unlist(msigdb_ids[pathway])), colnames(clinik.and.rna.pathways))
+
+  clinik.and.rna.pathways[pathway] <- rowMeans(clinik.and.rna.pathways[, genes])
+}
+
+pathways_to_test <- topPathways
+
+for(i in 1:10) {
+  genes <- sample(rownames(counts.rna.voom), 300)
+  clinik.and.rna.pathways[paste("pathway_", i, sep="")] <- rowMeans(clinik.and.rna.pathways[, genes])
+  pathways_to_test <- c(pathways_to_test, paste("pathway_", i, sep=""))
+}
+
+head(clinik.and.rna.pathways[pathways_to_test])
+#clinik.and.rna[, test_pathway[, 1][test_pathway[, 1] %in% colnames(clinik.and.rna)]]
+#rowMeans(clinik.and.rna[, test_pathway[, 1][test_pathway[, 1] %in% colnames(clinik.and.rna)]])
+```
+
+```{r}
+Survfun <- function(gene) as.formula(paste("Surv(times,patient.vital_status)",gene,sep="~"))
+
+survival.coxph.pathways <- 
+  sapply(pathways_to_test, function(gene) summary(coxph(Survfun(gene), data=clinik.and.rna.pathways)))
+```
+
+```{r}
+survival.coxph.pathways <- survival.coxph.pathways %>% t() %>% as.data.frame() %>% dplyr::select(coefficients)
+survival.coxph.pathways[1,]
+coxph(Surv(times,patient.vital_status)~LINDGREN_BLADDER_CANCER_CLUSTER_2B, data=clinik.and.rna.pathways)
+```
+
+```{r}
+survival.coxph.pathways.rownames <- rownames(survival.coxph.pathways)
+
+survival.coxph.pathways <- as.data.frame(matrix(unlist(survival.coxph.pathways),ncol=5,byrow=TRUE))
+rownames(survival.coxph.pathways) <- survival.coxph.pathways.rownames
+colnames(survival.coxph.pathways) <- c("coef", "HR", "se", "z", "Pval")
+
+survival.coxph.pathways %>% arrange(Pval)
+```
+
+```{r}
+mean(clinik.and.rna.pathways$BLANCO_MELO_BRONCHIAL_EPITHELIAL_CELLS_INFLUENZA_A_DEL_NS1_INFECTION_UP)
+hist(clinik.and.rna.pathways$BLANCO_MELO_BRONCHIAL_EPITHELIAL_CELLS_INFLUENZA_A_DEL_NS1_INFECTION_UP)
+ggplot(clinik.and.rna.pathways, aes(BLANCO_MELO_BRONCHIAL_EPITHELIAL_CELLS_INFLUENZA_A_DEL_NS1_INFECTION_UP)) + geom_histogram(bins=20)
+```
+
+```{r}
+clinik.and.rna.pathways$BLANCO_MELO_BRONCHIAL_EPITHELIAL_CELLS_INFLUENZA_A_DEL_NS1_INFECTION_UP_amount <-
+  cut(clinik.and.rna.pathways$BLANCO_MELO_BRONCHIAL_EPITHELIAL_CELLS_INFLUENZA_A_DEL_NS1_INFECTION_UP,
+      breaks=c(-Inf, 5.177362, Inf),
+      labels=c("low", "high"))
+
+ggsurvplot(survfit(Surv(times, patient.vital_status)~BLANCO_MELO_BRONCHIAL_EPITHELIAL_CELLS_INFLUENZA_A_DEL_NS1_INFECTION_UP_amount,
+                   data=clinik.and.rna.pathways), pval=TRUE, conf.int=TRUE)
+```
+
+```{r}
+mean(clinik.and.rna.pathways$RODWELL_AGING_KIDNEY_UP)
+hist(clinik.and.rna.pathways$RODWELL_AGING_KIDNEY_UP)
+ggplot(clinik.and.rna.pathways, aes(RODWELL_AGING_KIDNEY_UP)) + geom_histogram(bins=20)
+```
+
+```{r}
+clinik.and.rna.pathways$RODWELL_AGING_KIDNEY_UP_amount <-
+  cut(clinik.and.rna.pathways$RODWELL_AGING_KIDNEY_UP,
+      breaks=c(-Inf, 5.979445, Inf),
+      labels=c("low", "high"))
+
+ggsurvplot(survfit(Surv(times, patient.vital_status)~RODWELL_AGING_KIDNEY_UP_amount,
+                   data=clinik.and.rna.pathways), pval=TRUE, conf.int=TRUE)
+```
+
+```{r}
+mean(clinik.and.rna.pathways$SMID_BREAST_CANCER_NORMAL_LIKE_UP)
+hist(clinik.and.rna.pathways$SMID_BREAST_CANCER_NORMAL_LIKE_UP)
+ggplot(clinik.and.rna.pathways, aes(SMID_BREAST_CANCER_NORMAL_LIKE_UP)) + geom_histogram(bins=20)
+```
+
+```{r}
+clinik.and.rna.pathways$SMID_BREAST_CANCER_NORMAL_LIKE_UP_amount <-
+  cut(clinik.and.rna.pathways$SMID_BREAST_CANCER_NORMAL_LIKE_UP,
+      breaks=c(-Inf, 4.874391, Inf),
+      labels=c("low", "high"))
+
+ggsurvplot(survfit(Surv(times, patient.vital_status)~SMID_BREAST_CANCER_NORMAL_LIKE_UP_amount,
+                   data=clinik.and.rna.pathways), pval=TRUE, conf.int=TRUE)
+```
+
+```{r}
+mean(clinik.and.rna.pathways$LINDGREN_BLADDER_CANCER_CLUSTER_2B)
+hist(clinik.and.rna.pathways$LINDGREN_BLADDER_CANCER_CLUSTER_2B)
+ggplot(clinik.and.rna.pathways, aes(LINDGREN_BLADDER_CANCER_CLUSTER_2B)) + geom_histogram(bins=20)
+```
+
+```{r}
+clinik.and.rna.pathways$LINDGREN_BLADDER_CANCER_CLUSTER_2B_amount <-
+  cut(clinik.and.rna.pathways$LINDGREN_BLADDER_CANCER_CLUSTER_2B,
+      breaks=c(-Inf, 5.558428, Inf),
+      labels=c("low", "high"))
+
+ggsurvplot(survfit(Surv(times, patient.vital_status)~LINDGREN_BLADDER_CANCER_CLUSTER_2B_amount,
+                   data=clinik.and.rna.pathways), pval=TRUE, conf.int=TRUE)
+```
